@@ -1,270 +1,273 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from routers import csv_mock, model_mock, categories_mock
-
-import csv
+from __future__ import annotations
+from typing import List, Tuple, NamedTuple
+import math
+import pathlib
 import io
-import random
-from typing import List, Tuple, Dict, Any, Union
+import tempfile
 
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+_DEFAULT_SEED = 42
+rng = np.random.default_rng(_DEFAULT_SEED)
+torch.manual_seed(_DEFAULT_SEED)
+
+
+def generate_curve(design: np.ndarray, T: int = 60) -> np.ndarray:
+    design = np.maximum(design, 0.0)
+    design = design / (np.linalg.norm(design) + 1e-8)
+    D = design.size
+
+    theta = np.ones(3 * D)
+    f, phi, A = np.split(theta, 3)
+
+    def _logistic_sequence(T_: int, seed_: float, r_: float = 4.0) -> np.ndarray:
+        seq = np.empty(T_, dtype=float)
+        seq[0] = seed_
+        for k in range(1, T_):
+            seq[k] = r_ * seq[k - 1] * (1.0 - seq[k - 1])
+        return seq
+
+    seeds = np.linspace(0.1, 0.9, D)
+    chaotic = np.vstack([_logistic_sequence(T, s) for s in seeds]) - 0.5
+
+    t = np.linspace(0.0, 1.0, T)
+    y = np.zeros(T)
+    for i in range(D):
+        eff_freq = f[i] + A[i] * chaotic[i]
+        y += design[i] * np.sin(2 * math.pi * eff_freq * t + phi[i])
+    return y
+
+
+def multi_objective_criteria(curve: np.ndarray, ref_curves: List[np.ndarray]) -> np.ndarray:
+    criteria = [-np.sum(np.exp(-np.abs(curve - ref))) for ref in ref_curves]
+    return np.asarray(criteria)
+
+
+def compute_pareto_front(criteria: np.ndarray) -> np.ndarray:
+    n = criteria.shape[0]
+    efficient = np.ones(n, dtype=bool)
+    for i in range(n):
+        if not efficient[i]:
+            continue
+        dominated = np.all(criteria <= criteria[i], axis=1) & np.any(criteria < criteria[i], axis=1)
+        efficient = efficient & ~dominated
+        efficient[i] = True
+    return efficient
+
+
+class SeqRegressor(nn.Module):
+
+    def __init__(self, hidden: int = 64, num_layers: int = 1, output_dim: int = 18):
+        super().__init__()
+        self.lstm = nn.LSTM(input_size=1, hidden_size=hidden, num_layers=num_layers,
+                            batch_first=True, dropout=0.1)
+        self.fc = nn.Linear(hidden, output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.unsqueeze(-1)
+        lstm_out, _ = self.lstm(x)
+        out = lstm_out[:, -1, :]
+        out = torch.relu(self.fc(out))
+        out = out / (torch.norm(out, dim=1, keepdim=True) + 1e-8)
+        return out
+
+
+def _mc_dropout_predict(model: nn.Module, X: torch.Tensor, n_samples: int = 25) -> Tuple[np.ndarray, np.ndarray]:
+    model.train()
+    preds = []
+    with torch.no_grad():
+        for _ in range(n_samples):
+            preds.append(model(X).cpu().numpy())
+    arr = np.array(preds)
+    return arr.mean(axis=0), arr.std(axis=0)
+
+class Suggestion(NamedTuple):
+    pareto_mask: np.ndarray
+    next_design: np.ndarray
+    predicted_curve: np.ndarray
+
+
+class SuggestionWithLoss(NamedTuple):
+    suggestion: Suggestion
+    loss_history: List[float]
+
+
+def run_suggestion_logic(
+        designs_df: pd.DataFrame,
+        weight_set: np.ndarray,
+        ref_curves: List[np.ndarray],
+        dataset: List[Tuple[np.ndarray, np.ndarray]],
+        curve_len: int = 60,
+        hidden_dim: int = 64,
+        epochs: int = 50,
+        lr: float = 1e-3,
+) -> SuggestionWithLoss:
+    designs = designs_df.values.astype(float)
+    curves = np.vstack([generate_curve(d, T=curve_len) for d in designs])
+    objectives = np.vstack([multi_objective_criteria(c, ref_curves) for c in curves])
+    weighted = objectives * weight_set
+    pareto = compute_pareto_front(weighted)
+
+    ds_designs = np.vstack([d for _, d in dataset])
+    ds_curves = np.vstack([generate_curve(d, T=curve_len) for d in ds_designs])
+
+    X_train = torch.tensor(ds_curves, dtype=torch.float32)
+    y_train = torch.tensor(ds_designs, dtype=torch.float32)
+
+    model = SeqRegressor(hidden=hidden_dim, output_dim=18)
+    opt = optim.Adam(model.parameters(), lr=lr)
+    loss_fn = nn.MSELoss()
+
+    loss_history = []
+    model.train()
+    for _ in range(epochs):
+        opt.zero_grad()
+        loss = loss_fn(model(X_train), y_train)
+        loss.backward()
+        opt.step()
+        loss_history.append(loss.item())
+
+    pareto_idxs = np.where(pareto)[0]
+    if len(pareto_idxs) == 0:
+        best_global = 0
+    else:
+        X_p = torch.tensor(curves[pareto_idxs], dtype=torch.float32)
+        _, std = _mc_dropout_predict(model, X_p, n_samples=25)
+        best_local = int(np.argmin(np.linalg.norm(std, axis=1)))
+        best_global = pareto_idxs[best_local]
+
+    suggestion = Suggestion(
+        pareto_mask=pareto,
+        next_design=designs[best_global],
+        predicted_curve=curves[best_global],
+    )
+    return SuggestionWithLoss(suggestion=suggestion, loss_history=loss_history)
+
 app = FastAPI(
-    title="Emergent Representation Mock Backend",
-    description="Processes CSV data to generate mocked array outputs based on user-provided logic and documentation.",
-    version="1.0.0"
+    title="Design Suggestion Backend",
+    description="Suggests next design point from CSV or vector using multi-objective optimisation and LSTM surrogate.",
+    version="3.0.0"  # Zintegrowana wersja
 )
 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"],
 )
 
-app.include_router(csv_mock.router)
-app.include_router(model_mock.router)
-app.include_router(categories_mock.router)
+class CsvPayload(BaseModel):
+    weight_set: List[float]
 
-class ProcessedOutput(BaseModel):
-    next_point: List[float]
-    curve: List[float]
-    performance_value: float
 
-class InputVectorPayload(BaseModel):
+class VectorPayload(BaseModel):
     vector: List[float]
+    weight_set: List[float]
 
-class ProcessingResult(BaseModel):
-    input_row_index: int
-    original_input_vector: List[Union[float, str]]
-    processed_data: ProcessedOutput
-    info: str
 
-class TrainingPayload(BaseModel):
-    vector: List[float]
-    epochs: int = 10
-    iterations: int = 1
+class TrainingPayload(VectorPayload):
+    epochs: int
+    iterations: int
 
-class TrainingResult(BaseModel):
-    final_result: ProcessingResult
-    loss_history: List[float]
-    epochs_completed: int
 
-def mock_process_arrays_from_vector(
-    input_vector: np.ndarray,
-    zeros_length_param: int = -1
-) -> Tuple[np.ndarray, np.ndarray, float, str]:
-    design = np.array(input_vector, dtype=float)
-    info_message = ""
+def get_common_data():
+    rng = np.random.default_rng(42)
+    ref_curves = [rng.random(60) for _ in range(9)]
+    dataset = []
+    for _ in range(50):
+        d = rng.random(18);
+        d /= np.linalg.norm(d) + 1e-8
+        dataset.append((multi_objective_criteria(generate_curve(d), ref_curves), d))
+    return ref_curves, dataset
 
-    weights = design * np.random.uniform(0.9, 1.1, size=design.shape)
-    weights = np.round(weights, 4)
 
-    if zeros_length_param > 0:
-        zeros_length = zeros_length_param
-        info_message += f"Using provided zeros_length: {zeros_length}. "
-    else:
-        zeros_length = max(1, int(np.ceil(len(design) / 2.0)))
-        info_message += f"Dynamically set zeros_length: {zeros_length} (half of input length {len(design)}). "
-
-    if len(design) == 3 and np.linalg.norm(design) > 1e-9:
-        norm_val = np.linalg.norm(design)
-        norm_design = design / norm_val if norm_val > 1e-9 else np.copy(design) 
-        
-        phi_arg = np.clip(norm_design[2], -1.0, 1.0)
-        phi = np.arccos(phi_arg)
-        theta = np.arctan2(norm_design[1], norm_design[0])
-        
-        next_point = np.array([phi, theta])
-        info_message += "Processed as 3D Cartesian-like input: next_point is mock 2D Spherical [phi, theta]. "
-    elif len(design) == 2:
-        phi_in, theta_in = design[0], design[1]
-        
-        phi = np.clip(phi_in, 0, np.pi) 
-        theta = theta_in 
-
-        x = np.sin(phi) * np.cos(theta)
-        y = np.sin(phi) * np.sin(theta)
-        z = np.cos(phi)
-        next_point = np.array([x, y, z])
-        info_message += "Processed as 2D Spherical-like input: next_point is mock 3D Cartesian [x,y,z] (unit norm). "
-    elif len(design) > 0 :
-        next_point = design * np.random.uniform(0.7, 1.3) + np.random.normal(0, 0.1, size=design.shape)
-        info_message += f"Processed as generic {len(design)}D vector: next_point is scaled/noised input. "
-    else:
-        next_point = np.array([])
-        info_message += "Input vector is empty. "
-
-    next_point = np.round(next_point, 4)
-
-    appended_zeros = np.zeros(zeros_length, dtype=float) 
-    if len(weights) > 0:
-        curve = np.concatenate((weights, appended_zeros))
-    else: 
-        curve = appended_zeros
-    curve = np.round(curve, 4)
-
-    if len(next_point) > 0:
-        performance_value = float(np.sum(next_point))
-        info_message += f"Performance is sum of next_point elements."
-    else:
-        performance_value = 0.0
-        info_message += f"Performance is 0.0 due to empty next_point."
-    
-    performance_value = round(performance_value, 4)
-
-    return next_point, curve, performance_value, info_message.strip()
-
-@app.post("/process-csv/", response_model=List[ProcessingResult])
-async def process_csv_file(file: UploadFile = File(...)):
+@app.post("/suggest-next/", response_model=dict)
+async def suggest_next_design_from_csv(file: UploadFile = File(...), payload: str = Form(...)):
     if not file.filename.endswith('.csv'):
-        raise HTTPException(status_code=400, detail="Invalid file type. Please upload a CSV file.")
-
-    contents = await file.read()
-    
-    try:
-        decoded_contents = contents.decode('utf-8')
-    except UnicodeDecodeError:
-        try:
-            decoded_contents = contents.decode('latin-1') 
-        except UnicodeDecodeError:
-            raise HTTPException(status_code=400, detail="Could not decode CSV file. Ensure it's UTF-8 or Latin-1 encoded.")
-
-    csv_reader = csv.reader(io.StringIO(decoded_contents))
-    results: List[ProcessingResult] = []
-    
-    header_skipped = False
-    processed_rows_count = 0
-
-    for i, row_str_list in enumerate(csv_reader):
-        current_row_index_for_output = i
-
-        if not row_str_list:
-            continue
-        
-        if not header_skipped and i == 0 and any(char.isalpha() for val in row_str_list for char in val):
-            header_skipped = True
-            continue 
-
-        input_vector_list_float: List[float] = []
-        valid_row = True
-        problematic_original_row: List[Union[float, str]] = []
-
-        try:
-            for val_str in row_str_list:
-                stripped_val = val_str.strip()
-                if stripped_val:
-                    input_vector_list_float.append(float(stripped_val))
-                    problematic_original_row.append(float(stripped_val))
-            
-            if not input_vector_list_float and any(s.strip() for s in row_str_list): 
-                raise ValueError("Row resulted in empty numeric vector after stripping.")
-
-            input_vector_np = np.array(input_vector_list_float)
-        except ValueError:
-            valid_row = False
-            problematic_original_row = [val.strip() for val in row_str_list]
-
-        if not valid_row or not input_vector_list_float :
-            results.append(
-                ProcessingResult(
-                    input_row_index=current_row_index_for_output,
-                    original_input_vector=problematic_original_row if problematic_original_row else ["EMPTY_ROW_CONTENT"],
-                    processed_data=ProcessedOutput(next_point=[], curve=[], performance_value=0.0),
-                    info=f"Skipped row {current_row_index_for_output}: Contains non-numeric data or is effectively empty."
-                )
-            )
-            continue
-        
-        processed_rows_count +=1
-        next_p, crv, perf_val, info = mock_process_arrays_from_vector(input_vector_np)
-
-        results.append(
-            ProcessingResult(
-                input_row_index=current_row_index_for_output,
-                original_input_vector=input_vector_list_float,
-                processed_data=ProcessedOutput(
-                    next_point=next_p.tolist(),
-                    curve=crv.tolist(),
-                    performance_value=perf_val
-                ),
-                info=info
-            )
-        )
-
-    if processed_rows_count == 0:
-        if header_skipped and not results:
-            raise HTTPException(status_code=400, detail="CSV file seems to contain only a header or is empty after header.")
-        elif not results and not header_skipped :
-            raise HTTPException(status_code=400, detail="CSV file is empty or contains no processable numeric data.")
-        elif not results and processed_rows_count == 0 :
-            raise HTTPException(status_code=400, detail="No processable numeric data found in CSV rows.")
-
-    return results
-
-@app.post("/process-vector/", response_model=ProcessingResult)
-async def process_single_vector(payload: InputVectorPayload):
-    if not payload.vector:
-        raise HTTPException(status_code=400, detail="Input vector cannot be empty.")
+        raise HTTPException(status_code=400, detail="Only CSV files are supported.")
 
     try:
-        input_vector_np = np.array(payload.vector, dtype=float)
-        
-        next_p, crv, perf_val, info = mock_process_arrays_from_vector(input_vector_np)
+        df = pd.read_csv(io.BytesIO(await file.read()), header=None)
+        if df.shape[1] != 18:
+            raise ValueError("CSV must have exactly 18 columns")
 
-        result = ProcessingResult(
-            input_row_index=0,
-            original_input_vector=payload.vector,
-            processed_data=ProcessedOutput(
-                next_point=next_p.tolist(),
-                curve=crv.tolist(),
-                performance_value=perf_val
-            ),
-            info=info
-        )
-        return result
+        parsed_payload = CsvPayload.parse_raw(payload)
+        weight_set = np.array(parsed_payload.weight_set)
 
+        ref_curves, dataset = get_common_data()
+        result = run_suggestion_logic(df, weight_set, ref_curves, dataset, epochs=50)
+
+        return {
+            "next_design": result.suggestion.next_design.tolist(),
+            "predicted_curve": result.suggestion.predicted_curve.tolist(),
+            "pareto_mask": result.suggestion.pareto_mask.tolist(),
+        }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"An internal error occurred: {str(e)}")
-    
-@app.post("/run-training/", response_model=TrainingResult)
-async def run_training_simulation(payload: TrainingPayload):
-    if not payload.vector:
-        raise HTTPException(status_code=400, detail="Input vector cannot be empty.")
-    if not 1 <= payload.epochs <= 1000:
-        raise HTTPException(status_code=400, detail="Epochs must be between 1 and 1000.")
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 
-    loss_history = []
-    current_vector_np = np.array(payload.vector, dtype=float)
-    
-    initial_loss = np.random.uniform(0.8, 1.5)
-    decay_rate = np.random.uniform(0.75, 0.95)
 
-    for epoch in range(payload.epochs):
-        noise = np.random.normal(0, 0.05, size=current_vector_np.shape)
-        current_vector_np = current_vector_np * np.random.uniform(0.98, 1.02) + noise
-        
-        loss = initial_loss * (decay_rate ** epoch) + np.random.uniform(-0.05, 0.05)
-        loss_history.append(round(max(0.01, loss), 4))
+@app.post("/process-vector/", response_model=dict)
+async def process_vector(payload: VectorPayload):
+    try:
+        input_vector = np.array(payload.vector)
+        if input_vector.shape != (18,):
+            raise ValueError("Input vector must contain exactly 18 elements.")
 
-    next_p, crv, perf_val, info = mock_process_arrays_from_vector(current_vector_np)
-    
-    final_processing_result = ProcessingResult(
-        input_row_index=0,
-        original_input_vector=payload.vector,
-        processed_data=ProcessedOutput(
-            next_point=next_p.tolist(),
-            curve=crv.tolist(),
-            performance_value=perf_val
-        ),
-        info=f"Result after {payload.epochs} simulated epochs. {info}"
-    )
+        df = pd.DataFrame([input_vector])
+        weight_set = np.array(payload.weight_set)
+        ref_curves, dataset = get_common_data()
 
-    return TrainingResult(
-        final_result=final_processing_result,
-        loss_history=loss_history,
-        epochs_completed=payload.epochs
-    )
+        result = run_suggestion_logic(df, weight_set, ref_curves, dataset, epochs=1)
+
+        processed_data = {
+            "next_point": result.suggestion.next_design.tolist(),
+            "curve": result.suggestion.predicted_curve.tolist(),
+            "performance_value": np.sum(result.suggestion.predicted_curve)
+        }
+        return {
+            "input_row_index": 0,
+            "original_input_vector": payload.vector,
+            "processed_data": processed_data,
+            "info": "Wygenerowano z pojedynczego wektora (1 epoka)."
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An unexpected internal error occurred: {str(e)}")
+
+
+@app.post("/run-training/", response_model=dict)
+async def run_training(payload: TrainingPayload):
+    """Przetwarza pojedynczy wektor z zadaną liczbą epok treningu."""
+    try:
+        input_vector = np.array(payload.vector)
+        if input_vector.shape != (18,):
+            raise ValueError("Input vector must contain exactly 18 elements.")
+
+        df = pd.DataFrame([input_vector])
+        weight_set = np.array(payload.weight_set)
+        ref_curves, dataset = get_common_data()
+
+        result = run_suggestion_logic(df, weight_set, ref_curves, dataset, epochs=payload.epochs)
+
+        processed_data = {
+            "next_point": result.suggestion.next_design.tolist(),
+            "curve": result.suggestion.predicted_curve.tolist(),
+            "performance_value": np.sum(result.suggestion.predicted_curve)
+        }
+        final_result = {
+            "input_row_index": 0,
+            "original_input_vector": payload.vector,
+            "processed_data": processed_data,
+            "info": f"Wygenerowano po {payload.epochs} epokach treningu."
+        }
+        return {
+            "final_result": final_result,
+            "loss_history": result.loss_history,
+            "epochs_completed": payload.epochs
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"An unexpected internal error occurred: {str(e)}")
